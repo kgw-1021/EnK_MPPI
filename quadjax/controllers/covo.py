@@ -237,10 +237,10 @@ class CoVOController(controllers.BaseController):
             )
 
         # repeat env_state each element to match the sample size N
-        state_repeat = jax.tree_map(
+        state_repeat = jax.tree_util.tree_map(
             lambda x: jnp.repeat(jnp.asarray(x)[None, ...], self.N, axis=0), env_state
         )
-        env_params_repeat = jax.tree_map(
+        env_params_repeat = jax.tree_util.tree_map(
             lambda x: jnp.repeat(jnp.asarray(x)[None, ...], self.N, axis=0), env_params
         )
         done_repeat = jnp.full(self.N, False)

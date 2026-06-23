@@ -5,3 +5,4 @@ from quadjax.controllers.pid import *
 
 from quadjax.controllers.mppi import MPPIController, MPPIParams
 from quadjax.controllers.covo import CoVOController, CoVOParams
+from quadjax.controllers.eks import EKSController, EKSParams

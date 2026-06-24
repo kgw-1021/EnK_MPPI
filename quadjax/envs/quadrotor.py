@@ -747,15 +747,23 @@ def get_controller(env, controller_name, controller_params=None, debug=False):
         controller = controllers.CoVOController(
             env=env, control_params=control_params, N=N, H=H, lam=lam, mode=mode
         )
-    elif controller_name == "eks":
+    elif "eks" in controller_name:
         N, H, lam, sigma = parse_sample_params(controller_params)
         if debug:
             N, H = 4, 2
             print(f"[DEBUG], override controller parameters to be: N={N}, H={H}")
+        # observation mode: eks_time (default) | eks_type | eks_both
+        if "type" in controller_name:
+            eks_mode = "type"
+        elif "both" in controller_name:
+            eks_mode = "both"
+        else:
+            eks_mode = "time"
         a_mean = get_sample_mean(env)
         sigmas = jnp.array([sigma] * env.action_dim)
         a_cov_per_step = jnp.diag(sigmas**2)
         a_cov = jnp.tile(a_cov_per_step, (H, 1, 1))
+        # same cost weights as the other methods (reproduces tracking_penyaw_reward_fn)
         control_params = controllers.EKSParams(
             gamma_mean=1.0,
             gamma_sigma=0.0,
@@ -763,9 +771,10 @@ def get_controller(env, controller_name, controller_params=None, debug=False):
             sample_sigma=sigma,
             a_mean=a_mean,
             a_cov=a_cov,
+            weights=utils.DEFAULT_PENYAW_WEIGHTS,
         )
         controller = controllers.EKSController(
-            env=env, control_params=control_params, N=N, H=H, lam=lam
+            env=env, control_params=control_params, N=N, H=H, lam=lam, mode=eks_mode
         )
     else:
         raise NotImplementedError

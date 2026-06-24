@@ -1,0 +1,35 @@
+python ../scripts\plot_traj.py -f state_seq_covo-online.pkl state_seq_mppi.pkl state_seq_eks.pkl
+Loading files and processing data...
+
+==================================================
+            Algorithm Analysis Summary            
+==================================================
+Algorithm       | Avg Pos Error (m) | Avg Vel Error (m/s)
+--------------------------------------------------
+covo-online     | 0.0431          | 0.4829         
+mppi            | 0.0490          | 0.4962         
+eks             | 0.0235          | 0.3856         
+==================================================
+Displaying plots. Close the windows to exit.
+
+python quadrotor.py --controller mppi --task tracking_zigzag --mode eval --disturb_type none --noDR --name "mppi"
+starting test...
+[DEBUG] test traj 1
+100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 40/40 [07:48<00:00, 11.72s/it]
+env running time: 775.11s
+err_pos mean: 0.038, std: 0.002
+$3.79 \pm 0.24$
+python quadrotor.py --controller covo-online --task tracking_zigzag --mode eval --disturb_type none --noDR --name "covo-online"
+starting test...
+[DEBUG] test traj 1
+100%|██████████████████████████████████████████████| 40/40 [29:34<00:00, 44.37s/it]
+env running time: 2760.07s
+err_pos mean: 0.034, std: 0.002
+$3.36 \pm 0.23$
+python quadrotor.py --controller eks --task tracking_zigzag --mode eval --disturb_type none --noDR --name "eks"
+starting test...
+[DEBUG] test traj 1
+100%|██████████████████████████████████████████████| 40/40 [34:38<00:00, 51.97s/it]
+env running time: 3501.52s
+err_pos mean: 0.018, std: 0.001
+$1.84 \pm 0.09$

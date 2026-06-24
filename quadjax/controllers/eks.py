@@ -10,37 +10,32 @@ from quadjax import controllers
 
 @struct.dataclass
 class EKSParams:
-    """Parameters/state for the Ensemble Kalman Sampler controller.
+    gamma_mean: float  # mean of gamma
+    gamma_sigma: float  # std of gamma
+    discount: float  # discount factor
+    sample_sigma: float  # std of sampling
 
-    Sampling is a fixed isotropic Gaussian around the warm-started mean
-    (MPPI-style); the "intelligence" lives in the Gauss-Newton transport, not in
-    the sampling distribution. `gw` weights the four residual terms
-    [track, vel, smooth, effort].
-    """
-
-    a_mean: jnp.ndarray  # (H, action_dim) warm-started control mean
-    a_hover: jnp.ndarray  # (action_dim,) effort target (hover action)
-    sample_sigma: jnp.ndarray  # (action_dim,) per-dim isotropic sampling scale
-    gw: jnp.ndarray  # (4,) residual-term weights [track, vel, smooth, effort]
-    a_cov: jnp.ndarray  # (H*action_dim, H*action_dim) posterior covariance (debug)
+    a_mean: jnp.ndarray  # mean of action
+    a_cov: jnp.ndarray  # covariance matrix of action
 
 
 class EKSController(controllers.BaseController):
-    """Ensemble Kalman Sampler transport controller.
+    """Ensemble Kalman Sampler controller.
 
-    Each step samples an ensemble of control sequences around the warm-started
-    mean, then runs `n_inner` Gauss-Newton/Tikhonov Kalman updates that transport
-    the ensemble toward the posterior:
+    Identical to MPPI in parameters, isotropic sampling, rollout, and the
+    (reward-based) cost -- the only difference is the distribution update:
+    MPPI's softmax weighting + weighted mean is replaced by the EKS transport.
 
-        K = C^UG (C^GG + (1/alpha) I)^-1,   V <- V - K G,   then inflate,
+    The same cost is used (no hand-designed track/smooth/effort residuals); the
+    only change is that the per-step rewards are kept as an H-dimensional
+    observation G = -reward_seq (H, N) instead of being collapsed to a single
+    scalar, so the ensemble Kalman update has multiple directions to transport
+    along. Each inner iteration re-rolls out the transported ensemble and applies
 
-    where G stacks the (sqrt-weighted) residual blocks. Residuals are built from
-    the rolled-out trajectory (`env.step_env`) plus the actions:
-        track  = pos  - pos_tar      (from rollout)
-        vel    = vel  - vel_tar      (from rollout)
-        smooth = a[h] - a[h-1]       (from actions)
-        effort = a[h] - a_hover      (from actions)
-    The posterior mean's first control is returned.
+        K = C^UG (C^GG + (1/alpha) I)^-1,   V <- V - K (G - y),   then inflate,
+
+    with y the per-step best (lowest) cost across the ensemble. The posterior
+    ensemble mean's first control is returned.
     """
 
     def __init__(
@@ -49,75 +44,50 @@ class EKSController(controllers.BaseController):
         control_params,
         N: int,
         H: int,
-        n_inner: int = 10,
-        alpha: float = 1.0,
-        inflate: float = 1.05,
+        lam: float,
+        n_inner: int = 5,
+        alpha: float = 10.0,
+        inflate: float = 1.0,
     ) -> None:
         super().__init__(env, control_params)
-        self.N = N  # number of ensemble members (static)
-        self.H = H  # horizon (static)
-        self.n_inner = n_inner  # Gauss-Newton transport iterations (static)
-        self.alpha = alpha  # Tikhonov regularization (1/alpha on the diagonal)
+        self.N = N  # NOTE: N is the number of samples, set here as a static number
+        self.H = H
+        self.lam = lam  # kept for interface parity with MPPI/CoVO (unused by EKS)
+        self.n_inner = n_inner  # EKS transport iterations
+        self.alpha = alpha  # Tikhonov regularization (1/alpha on the C^GG diagonal)
         self.inflate = inflate  # ensemble inflation factor per inner iteration
         self.action_dim = env.action_dim
 
-    def _rollout_residuals(
-        self, env_state, env_params, a_sampled: jnp.ndarray, gw: jnp.ndarray,
-        a_hover: jnp.ndarray, key: chex.PRNGKey,
-    ):
-        """Roll out N action sequences and build the residual matrix G (p, N).
-
-        Returns (G, pos_seq) where pos_seq is (H, N, 3) for debug statistics.
-        """
-        N, H, ad = self.N, self.H, self.action_dim
+    def _rollout_rewards(self, env_state, env_params, a_sampled, step_key):
+        """Roll out N action sequences; return per-step rewards (H, N) and poses."""
 
         def rollout_fn(carry, action):
-            state, params, done_before = carry
-            _, state, _, done, _ = jax.vmap(
-                lambda s, a, p: self.env.step_env(key, s, a, p, True)
-            )(state, action, params)
-            return (state, params, done | done_before), (
-                state.pos,
-                state.pos_tar,
-                state.vel,
-                state.vel_tar,
+            env_state, params, reward_before, done_before = carry
+            obs, env_state, reward, done, info = jax.vmap(
+                lambda s, a, p: self.env.step_env(step_key, s, a, p, True)
+            )(env_state, action, params)
+            reward = jnp.where(done_before, reward_before, reward)
+            return (env_state, params, reward, done | done_before), (
+                reward,
+                env_state.pos,
             )
 
-        state_repeat = jax.tree_map(
-            lambda x: jnp.repeat(jnp.asarray(x)[None, ...], N, axis=0), env_state
+        state_repeat = jax.tree_util.tree_map(
+            lambda x: jnp.repeat(jnp.asarray(x)[None, ...], self.N, axis=0), env_state
         )
-        params_repeat = jax.tree_map(
-            lambda x: jnp.repeat(jnp.asarray(x)[None, ...], N, axis=0), env_params
+        env_params_repeat = jax.tree_util.tree_map(
+            lambda x: jnp.repeat(jnp.asarray(x)[None, ...], self.N, axis=0), env_params
         )
-        done_repeat = jnp.full(N, False)
+        done_repeat = jnp.full(self.N, False)
+        reward_repeat = jnp.full(self.N, 0.0)
 
-        _, (pos, pos_tar, vel, vel_tar) = lax.scan(
+        _, (rewards, poses) = lax.scan(
             rollout_fn,
-            (state_repeat, params_repeat, done_repeat),
-            a_sampled.transpose(1, 0, 2),  # (H, N, action_dim)
-            length=H,
+            (state_repeat, env_params_repeat, reward_repeat, done_repeat),
+            a_sampled.transpose(1, 0, 2),
+            length=self.H,
         )
-        # pos, pos_tar, vel, vel_tar: (H, N, 3)
-
-        # state-dependent residuals (from rollout)
-        r_track = (pos - pos_tar).transpose(0, 2, 1).reshape(H * 3, N)
-        r_vel = (vel - vel_tar).transpose(0, 2, 1).reshape(H * 3, N)
-
-        # action-dependent residuals (no rollout needed)
-        a = a_sampled.transpose(1, 0, 2)  # (H, N, action_dim)
-        r_smooth = (a[1:] - a[:-1]).transpose(0, 2, 1).reshape((H - 1) * ad, N)
-        r_effort = (a - a_hover[None, None, :]).transpose(0, 2, 1).reshape(H * ad, N)
-
-        G = jnp.concatenate(
-            [
-                jnp.sqrt(gw[0]) * r_track,
-                jnp.sqrt(gw[1]) * r_vel,
-                jnp.sqrt(gw[2]) * r_smooth,
-                jnp.sqrt(gw[3]) * r_effort,
-            ],
-            axis=0,
-        )  # (p, N)
-        return G, pos
+        return rewards, poses  # (H, N), (H, N, 3)
 
     @partial(jax.jit, static_argnums=(0,))
     def __call__(
@@ -129,59 +99,79 @@ class EKSController(controllers.BaseController):
         control_params: EKSParams,
         info,
     ) -> jnp.ndarray:
-        # inject noise to state elements (same convention as MPPI/CoVO)
+        # inject noise to env_state elements
         env_state = info["noisy_state"]
 
-        # shift operator (receding-horizon warm start)
+        # shift operator
         a_mean_old = control_params.a_mean
-        a_mean = jnp.concatenate([a_mean_old[1:], a_mean_old[-1:]])
-        control_params = control_params.replace(a_mean=a_mean)
+        a_cov_old = control_params.a_cov
 
-        d = self.H * self.action_dim
-        gw = control_params.gw
-        a_hover = control_params.a_hover
-
-        # sample ensemble V (d, N): fixed isotropic Gaussian around the mean
-        rng_act, sample_key = jax.random.split(rng_act)
-        sigma_vec = jnp.tile(control_params.sample_sigma, self.H)  # (d,)
-        noise = jax.random.normal(sample_key, (d, self.N))
-        V = a_mean.flatten()[:, None] + sigma_vec[:, None] * noise
-
-        # EKS transport: n_inner Gauss-Newton/Tikhonov Kalman updates
-        def inner(carry, _):
-            V, key = carry
-            key, roll_key = jax.random.split(key)
-            a_sampled = V.T.reshape(self.N, self.H, self.action_dim)
-            a_sampled = jnp.clip(a_sampled, -1.0, 1.0)
-            G, pos = self._rollout_residuals(
-                env_state, env_params, a_sampled, gw, a_hover, roll_key
-            )
-            p = G.shape[0]
-            Vc = V - V.mean(1, keepdims=True)
-            Gc = G - G.mean(1, keepdims=True)
-            Cug = (Vc @ Gc.T) / self.N
-            Cgg = (Gc @ Gc.T) / self.N
-            K = Cug @ jnp.linalg.inv(Cgg + (1.0 / self.alpha) * jnp.eye(p))
-            V = V - K @ G
-            # multiplicative inflation around the new mean
-            vbar = V.mean(1, keepdims=True)
-            V = vbar + (V - vbar) * self.inflate
-            return (V, key), (pos.mean(1), pos.std(1))
-
-        (V, _), (pos_mean_seq, pos_std_seq) = lax.scan(
-            inner, (V, rng_act), None, length=self.n_inner
+        control_params = control_params.replace(
+            a_mean=jnp.concatenate([a_mean_old[1:], a_mean_old[-1:]]),
+            a_cov=jnp.concatenate([a_cov_old[1:], a_cov_old[-1:]]),
         )
 
-        # posterior mean and covariance
-        Vc = V - V.mean(1, keepdims=True)
-        a_cov = (Vc @ Vc.T) / self.N
-        a_mean_new = V.mean(1).reshape(self.H, self.action_dim)
-        control_params = control_params.replace(a_mean=a_mean_new, a_cov=a_cov)
+        # sample action with mean and covariance, repeat for N times (N, H, action_dim)
+        rng_act, act_key = jax.random.split(rng_act)
+        act_keys = jax.random.split(act_key, self.N)
 
-        # first control of the optimized sequence
-        u = a_mean_new[0]
+        def single_sample(key, traj_mean, traj_cov):
+            keys = jax.random.split(key, self.H)
+            return jax.vmap(
+                lambda key, mean, cov: jax.random.multivariate_normal(key, mean, cov)
+            )(keys, traj_mean, traj_cov)
 
-        # debug values from the final transport iteration
-        info = {"pos_mean": pos_mean_seq[-1], "pos_std": pos_std_seq[-1]}
+        a_sampled = jax.vmap(single_sample, in_axes=(0, None, None))(
+            act_keys, control_params.a_mean, control_params.a_cov
+        )
+        a_sampled = jnp.clip(a_sampled, -1.0, 1.0)  # (N, H, action_dim)
+
+        # per-step discount weights (sqrt, so squared-misfit matches discounted cost)
+        disc = jnp.sqrt(jnp.power(control_params.discount, jnp.arange(self.H)))  # (H,)
+
+        # ensemble of flattened action samples: V (d, N), d = H * action_dim
+        V = a_sampled.reshape(self.N, -1).T
+
+        # === EKS transport (replaces MPPI softmax weighting + weighted mean) ===
+        def inner(carry, _):
+            V, key = carry
+            key, step_key = jax.random.split(key)
+            a_cur = jnp.clip(V.T.reshape(self.N, self.H, self.action_dim), -1.0, 1.0)
+            rewards, poses = self._rollout_rewards(
+                env_state, env_params, a_cur, step_key
+            )
+            # observation: per-step cost (drive down), discounted; (H, N)
+            G = (-rewards) * disc[:, None]
+            y = jnp.min(G, axis=1, keepdims=True)  # per-step best member (H, 1)
+
+            Vc = V - V.mean(axis=1, keepdims=True)
+            Gc = G - G.mean(axis=1, keepdims=True)
+            Cug = (Vc @ Gc.T) / self.N  # (d, H)
+            Cgg = (Gc @ Gc.T) / self.N  # (H, H)
+            # relative Tikhonov regularization (scale-invariant in the cost units):
+            # larger alpha -> smaller reg -> closer to the full Gauss-Newton step
+            reg = jnp.trace(Cgg) / self.H / self.alpha + 1e-8
+            K = Cug @ jnp.linalg.inv(Cgg + reg * jnp.eye(self.H))
+            V = V - K @ (G - y)  # (d, N)
+            # multiplicative inflation around the new mean
+            vbar = V.mean(axis=1, keepdims=True)
+            V = vbar + (V - vbar) * self.inflate
+            return (V, key), poses
+
+        (V, _), poses_seq = lax.scan(inner, (V, rng_act), None, length=self.n_inner)
+
+        # posterior ensemble mean, blended with gamma_mean (identical to MPPI)
+        a_mean_eks = V.mean(axis=1).reshape(self.H, self.action_dim)
+        a_mean = a_mean_eks * control_params.gamma_mean + control_params.a_mean * (
+            1 - control_params.gamma_mean
+        )
+        control_params = control_params.replace(a_mean=a_mean)
+
+        # get action
+        u = control_params.a_mean[0]
+
+        # debug values (from the final transport iteration)
+        poses = poses_seq[-1]
+        info = {"pos_mean": jnp.mean(poses, axis=1), "pos_std": jnp.std(poses, axis=1)}
 
         return u, control_params, info

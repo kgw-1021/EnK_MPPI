@@ -294,6 +294,51 @@ def tracking_penyaw_reward_fn(state: EnvState3D, params=None):
     return reward
 
 
+# default weights reproduce tracking_penyaw_reward_fn exactly: [pos, vel, yaw]
+DEFAULT_PENYAW_WEIGHTS = jnp.array([1.0, 0.05, 0.2])
+
+
+@jax.jit
+def tracking_penyaw_terms_fn(state: EnvState3D, params=None):
+    """Return the three UNWEIGHTED penalty terms of the penyaw tracking cost.
+
+    Returns a (3,) array [pos_pen, vel_pen, yaw_pen] where
+        pos_pen = log_pos_fn(||pos_tar - pos||)   (nonlinear position penalty)
+        vel_pen = ||vel_tar - vel||               (velocity error)
+        yaw_pen = |yaw|                           (yaw deviation)
+    The original reward is  1.3 - (w_pos*pos_pen + w_vel*vel_pen + w_yaw*yaw_pen)
+    with default weights [1.0, 0.05, 0.2]. Keeping the terms separate lets the
+    EKS transport observe each cost direction (and an adaptive-weight scheme
+    rebalance them) instead of collapsing everything into one scalar.
+    """
+    err_pos = jnp.linalg.norm(state.pos_tar - state.pos)
+    err_vel = jnp.linalg.norm(state.vel_tar - state.vel)
+    q = state.quat
+    yaw = jnp.arctan2(2 * (q[3] * q[2] + q[0] * q[1]), 1 - 2 * (q[1] ** 2 + q[2] ** 2))
+
+    pos_pen = log_pos_fn(err_pos)
+    vel_pen = err_vel
+    yaw_pen = jnp.abs(yaw)
+    return jnp.stack([pos_pen, vel_pen, yaw_pen])
+
+
+@jax.jit
+def tracking_penyaw_weighted_reward_fn(state: EnvState3D, params=None, weights=None):
+    """Weighted version of tracking_penyaw_reward_fn.
+
+    reward = 1.3 - (w_pos * pos_pen + w_vel * vel_pen + w_yaw * yaw_pen)
+
+    `weights` is a (3,) array [w_pos, w_vel, w_yaw]. If None, the default
+    [1.0, 0.05, 0.2] is used, reproducing tracking_penyaw_reward_fn exactly.
+    Pass time-varying weights here to drive covariance-based adaptive weighting.
+    """
+    if weights is None:
+        weights = DEFAULT_PENYAW_WEIGHTS
+    terms = tracking_penyaw_terms_fn(state, params)
+    reward = 1.3 - jnp.dot(weights, terms)
+    return reward
+
+
 @jax.jit
 def tracking_realworld_reward_fn(state: EnvState3D, params=None):
     # reward function from
@@ -311,60 +356,6 @@ def tracking_realworld_reward_fn(state: EnvState3D, params=None):
     reward = -cost
 
     return reward
-
-
-"""
-per-term cost decomposition
-
-Each `*_cost_components_fn` returns a jnp.array of the individual (non-negative)
-penalty scalars whose (negated) sum reconstructs the matching `*_reward_fn`:
-
-    reward = baseline - sum(components)
-
-This is the scalar decomposition consumed by sampling controllers that need
-per-term costs (e.g. an Ensemble Kalman Sampler / hierarchical weight
-adaptation), where `reward_fn`'s single scalar throws away the per-term
-structure. The companion `*_COST_NAMES`/`*_COST_BASELINE` describe each array.
-"""
-
-TRACKING_COST_NAMES = ("pos", "vel", "yaw")
-TRACKING_COST_BASELINE = 1.3
-
-TRACKING_REALWORLD_COST_NAMES = ("pos", "quat")
-TRACKING_REALWORLD_COST_BASELINE = 0.0
-
-
-@jax.jit
-def tracking_penyaw_cost_components_fn(state: EnvState3D, params=None) -> jnp.ndarray:
-    """Per-term penalties matching `tracking_penyaw_reward_fn`.
-
-    reward = TRACKING_COST_BASELINE - sum([c_pos, c_vel, c_yaw]).
-    """
-    err_pos = jnp.linalg.norm(state.pos_tar - state.pos)
-    err_vel = jnp.linalg.norm(state.vel_tar - state.vel)
-    q = state.quat
-    yaw = jnp.arctan2(2 * (q[3] * q[2] + q[0] * q[1]), 1 - 2 * (q[1] ** 2 + q[2] ** 2))
-    c_pos = log_pos_fn(err_pos)
-    c_vel = 0.05 * err_vel
-    c_yaw = 0.2 * jnp.abs(yaw)
-    return jnp.array([c_pos, c_vel, c_yaw])
-
-
-@jax.jit
-def tracking_realworld_cost_components_fn(
-    state: EnvState3D, params=None
-) -> jnp.ndarray:
-    """Per-term penalties matching `tracking_realworld_reward_fn`.
-
-    reward = TRACKING_REALWORLD_COST_BASELINE - sum([c_pos, c_quat]).
-    """
-    alpha_p = 5.0
-    alpha_R = 3.0
-    pos_err = jnp.mean((state.pos - state.pos_tar) ** 2)
-    quat_err = 1 - state.quat[3] ** 2
-    c_pos = 0.02 * alpha_p * pos_err
-    c_quat = 0.02 * alpha_R * quat_err
-    return jnp.array([c_pos, c_quat])
 
 
 """

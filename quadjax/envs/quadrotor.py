@@ -54,9 +54,6 @@ class Quad3D(BaseEnvironment):
                 self.default_params.dt,
             )
             self.reward_fn = utils.tracking_penyaw_reward_fn
-            self.reward_components_fn = utils.tracking_penyaw_cost_components_fn
-            self.cost_names = utils.TRACKING_COST_NAMES
-            self.cost_baseline = utils.TRACKING_COST_BASELINE
             self.get_init_state = self.get_zero_state
         elif task == "tracking_slow":
             # Note: this is the version with quadratic cost, which is preferred with large model error
@@ -66,9 +63,6 @@ class Quad3D(BaseEnvironment):
                 self.default_params.dt,
             )
             self.reward_fn = utils.tracking_realworld_reward_fn
-            self.reward_components_fn = utils.tracking_realworld_cost_components_fn
-            self.cost_names = utils.TRACKING_REALWORLD_COST_NAMES
-            self.cost_baseline = utils.TRACKING_REALWORLD_COST_BASELINE
             self.get_init_state = self.get_zero_state
         elif task == "tracking_zigzag":
             self.generate_traj = partial(
@@ -77,9 +71,6 @@ class Quad3D(BaseEnvironment):
                 self.default_params.dt,
             )
             self.reward_fn = utils.tracking_penyaw_reward_fn
-            self.reward_components_fn = utils.tracking_penyaw_cost_components_fn
-            self.cost_names = utils.TRACKING_COST_NAMES
-            self.cost_baseline = utils.TRACKING_COST_BASELINE
             self.get_init_state = self.get_zero_state
         elif task == "hovering":
             self.generate_traj = partial(
@@ -88,9 +79,6 @@ class Quad3D(BaseEnvironment):
                 self.default_params.dt,
             )
             self.reward_fn = utils.tracking_penyaw_reward_fn
-            self.reward_components_fn = utils.tracking_penyaw_cost_components_fn
-            self.cost_names = utils.TRACKING_COST_NAMES
-            self.cost_baseline = utils.TRACKING_COST_BASELINE
             self.get_init_state = self.get_zero_state
         else:
             raise NotImplementedError
@@ -258,20 +246,6 @@ class Quad3D(BaseEnvironment):
         info = self.get_info(info_key, state, next_state, params)
         obs = self.get_obs(next_state, params)
         return (obs, next_state, reward, done, info)
-
-    @partial(jax.jit, static_argnums=(0,))
-    def get_reward_components(
-        self, state: EnvState3D, params: EnvParams3D
-    ) -> jnp.ndarray:
-        """Per-term cost decomposition of `reward_fn` as a 1D scalar array.
-
-        Returns the individual non-negative penalty scalars (see `self.cost_names`)
-        such that `reward_fn(state, params) == self.cost_baseline - components.sum()`.
-        Sampling controllers that need per-term costs (e.g. an Ensemble Kalman
-        Sampler with hierarchical weight adaptation) consume this instead of the
-        single aggregate reward.
-        """
-        return self.reward_components_fn(state, params)
 
     def raw_step(
         self,
@@ -589,7 +563,7 @@ def eval_env(
     run_one_ep_jit = jax.jit(run_one_ep)
     num_eps = int(total_steps // env.default_params.max_steps_in_episode)
     err_pos_ep = []
-    num_trajs = 4
+    num_trajs = 1
     rng, rng_reset_meta = jax.random.split(rng)
     rng_reset_list = jax.random.split(rng_reset_meta, num_trajs)
     for i, rng_reset in enumerate(rng_reset_list):
@@ -697,7 +671,7 @@ def get_controller(env, controller_name, controller_params=None, debug=False):
     def parse_sample_params(param_text: str):
         # parse in format "N{sample_number}_H{horizon}_lam{lam}"
         if param_text == "":
-            N = 8192
+            N = 1024
             H = 32
             lam = 0.01
             sigma = 0.5
@@ -776,19 +750,22 @@ def get_controller(env, controller_name, controller_params=None, debug=False):
     elif controller_name == "eks":
         N, H, lam, sigma = parse_sample_params(controller_params)
         if debug:
-            N, H = 8, 2
+            N, H = 4, 2
             print(f"[DEBUG], override controller parameters to be: N={N}, H={H}")
         a_mean = get_sample_mean(env)
-        a_hover = a_mean[0]
+        sigmas = jnp.array([sigma] * env.action_dim)
+        a_cov_per_step = jnp.diag(sigmas**2)
+        a_cov = jnp.tile(a_cov_per_step, (H, 1, 1))
         control_params = controllers.EKSParams(
+            gamma_mean=1.0,
+            gamma_sigma=0.0,
+            discount=1.0,
+            sample_sigma=sigma,
             a_mean=a_mean,
-            a_hover=a_hover,
-            sample_sigma=jnp.array([sigma] * env.action_dim),
-            gw=jnp.array([10.0, 1.0, 1.0, 1.0]),  # [track, vel, smooth, effort]
-            a_cov=jnp.zeros((H * env.action_dim, H * env.action_dim)),
+            a_cov=a_cov,
         )
         controller = controllers.EKSController(
-            env=env, control_params=control_params, N=N, H=H
+            env=env, control_params=control_params, N=N, H=H, lam=lam
         )
     else:
         raise NotImplementedError

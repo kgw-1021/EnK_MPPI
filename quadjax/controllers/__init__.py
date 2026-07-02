@@ -5,4 +5,11 @@ from quadjax.controllers.pid import *
 
 from quadjax.controllers.mppi import MPPIController, MPPIParams
 from quadjax.controllers.covo import CoVOController, CoVOParams
-from quadjax.controllers.eks import EKSController, EKSParams
+from quadjax.controllers.eks import (
+    EKSController,
+    EKSParams,
+    tilt_constraint,
+    tilt_from_vertical_constraint,
+    thrust_constraint,
+)
+from quadjax.controllers import eks

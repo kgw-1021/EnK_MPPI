@@ -5,7 +5,7 @@ import os
 import matplotlib.pyplot as plt
 
 # --- 설정 및 인자 파싱 ---
-parser = argparse.ArgumentParser(description="Quadrotor Trajectory and Error Plotter")
+parser = argparse.ArgumentParser(description="Quadrotor Trajectory, Error and Control Input Plotter")
 parser.add_argument(
     "-f", "--files",
     nargs="+",
@@ -38,6 +38,10 @@ for idx, filename in enumerate(args.files):
         vel = np.array([state["vel"] for state in state_seq])
         vel_tar = np.array([state.get("vel_tar", np.zeros(3)) for state in state_seq])
         
+        # 💡 [추가] 제어 입력 변수 추출 (Thrust 및 3축 Torque)
+        thrust = np.array([state.get("last_thrust", 0.0) for state in state_seq])
+        torque = np.array([state.get("last_torque", np.zeros(3)) for state in state_seq])
+        
         if target_pos_traj is None:
             target_pos_traj = pos_tar
             
@@ -54,6 +58,8 @@ for idx, filename in enumerate(args.files):
             "pos": pos,
             "pos_error": pos_error,
             "vel_error": vel_error,
+            "thrust": thrust,    # 💡 저장
+            "torque": torque,    # 💡 저장
             "avg_pos_rmse": avg_pos_rmse,
             "avg_vel_rmse": avg_vel_rmse,
             "color": COLOR_LIST[idx % len(COLOR_LIST)]
@@ -75,16 +81,13 @@ if not results_data:
 fig1 = plt.figure(num="Figure 1: 3D Trajectory", figsize=(10, 8))
 ax1 = fig1.add_subplot(111, projection='3d')
 
-# Target 궤적 그리기 (검은 점선)
 if target_pos_traj is not None:
     ax1.plot(target_pos_traj[:, 0], target_pos_traj[:, 1], target_pos_traj[:, 2], 
              label="Target Trajectory", color='black', linestyle='--', linewidth=1.5)
 
-# 각 알고리즘별 실제 궤적 그리기
 for algo, data in results_data.items():
     pos = data["pos"]
     color = data["color"]
-    
     ax1.plot(pos[:, 0], pos[:, 1], pos[:, 2], label=f"Actual ({algo})", color=color, linewidth=2)
     ax1.scatter(pos[0, 0], pos[0, 1], pos[0, 2], color=color, marker='o', s=50, edgecolors='k', zorder=5)
 
@@ -96,7 +99,6 @@ ax1.legend(loc="upper left")
 ax1.grid(True)
 ax1.view_init(elev=25, azim=-45)
 
-# 축 비율을 동일하게 맞추기 위한 트릭
 extents = np.array([ax1.get_xlim3d(), ax1.get_ylim3d(), ax1.get_zlim3d()])
 centers = np.mean(extents, axis=1)
 max_width = np.max(np.abs(extents[:, 1] - extents[:, 0]))
@@ -114,17 +116,14 @@ fig2.suptitle("Tracking Error Comparison Over Time", fontsize=16, fontweight='bo
 for algo, data in results_data.items():
     steps = np.arange(len(data["pos_error"]))
     color = data["color"]
-    
     ax2_1.plot(steps, data["pos_error"], label=f"{algo}", color=color, linewidth=2)
     ax2_2.plot(steps, data["vel_error"], label=f"{algo}", color=color, linewidth=2)
 
-# Subplot 1 (Position) 설정
 ax2_1.set_title("Position Tracking Error (RMSE)", fontsize=13)
 ax2_1.set_ylabel("Error Distance (m)")
 ax2_1.grid(True, linestyle='--', alpha=0.7)
 ax2_1.legend(loc="upper right")
 
-# Subplot 2 (Velocity) 설정
 ax2_2.set_title("Velocity Tracking Error (RMSE)", fontsize=13)
 ax2_2.set_xlabel("Time Steps")
 ax2_2.set_ylabel("Error Speed (m/s)")
@@ -135,8 +134,46 @@ plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
 
 # ==========================================
-# 터미널(CMD) 최종 결과 출력
+# 💡 [추가] Figure 3: Control Input Comparison (Thrust & Torques)
 # ==========================================
+fig3, axs = plt.subplots(4, 1, num="Figure 3: Control Inputs", figsize=(10, 10), sharex=True)
+fig3.suptitle("Control Input Comparison Over Time", fontsize=16, fontweight='bold')
+
+for algo, data in results_data.items():
+    steps = np.arange(len(data["thrust"]))
+    color = data["color"]
+    
+    axs[0].plot(steps, data["thrust"], label=f"{algo}", color=color, linewidth=2)
+    axs[1].plot(steps, data["torque"][:, 0], label=f"{algo}", color=color, linewidth=2) # Roll
+    axs[2].plot(steps, data["torque"][:, 1], label=f"{algo}", color=color, linewidth=2) # Pitch
+    axs[3].plot(steps, data["torque"][:, 2], label=f"{algo}", color=color, linewidth=2) # Yaw
+
+# Subplot 1: Total Thrust
+axs[0].set_title("Collective Thrust", fontsize=12)
+axs[0].set_ylabel("Thrust (N)")
+axs[0].grid(True, linestyle='--', alpha=0.7)
+axs[0].legend(loc="upper right")
+
+# Subplot 2: Roll Torque
+axs[1].set_title("Roll Torque (τ_x)", fontsize=12)
+axs[1].set_ylabel("Torque (Nm)")
+axs[1].grid(True, linestyle='--', alpha=0.7)
+
+# Subplot 3: Pitch Torque
+axs[2].set_title("Pitch Torque (τ_y)", fontsize=12)
+axs[2].set_ylabel("Torque (Nm)")
+axs[2].grid(True, linestyle='--', alpha=0.7)
+
+# Subplot 4: Yaw Torque
+axs[3].set_title("Yaw Torque (τ_z)", fontsize=12)
+axs[3].set_xlabel("Time Steps")
+axs[3].set_ylabel("Torque (Nm)")
+axs[3].grid(True, linestyle='--', alpha=0.7)
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+
+# --- 터미널(CMD) 최종 결과 출력 ---
 print("\n" + "="*50)
 print(f"{'Algorithm Analysis Summary':^50}")
 print("="*50)
@@ -149,5 +186,4 @@ for algo, data in results_data.items():
 print("="*50)
 print("Displaying plots. Close the windows to exit.")
 
-# 그래프 띄우기 (Figure 1, 2가 동시에 뜸)
 plt.show()

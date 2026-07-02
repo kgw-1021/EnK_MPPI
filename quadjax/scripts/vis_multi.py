@@ -41,12 +41,10 @@ def create_text_texture(text, color_hex):
     g_col = (color_hex >> 8) & 255
     b = color_hex & 255
     
-    # 기본 폰트는 작으므로 크기를 지정할 수 없지만, 선명한 해상도를 위해 그대로 그리고 크게 스케일링
-    # 만약 컴퓨터에 있는 특정 폰트를 쓰려면 ImageFont.truetype("arial.ttf", 60) 등을 사용
     font = ImageFont.load_default()
     try:
         # 가급적 큰 폰트 시도 (에러시 기본 폰트)
-        font = ImageFont.truetype("arial.ttf", 80)
+        font = ImageFont.truetype("arial.ttf", 20)
     except:
         pass
         

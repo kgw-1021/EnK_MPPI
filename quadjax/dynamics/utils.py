@@ -363,9 +363,13 @@ visualization functions
 """
 
 
-def plot_states(state_seq, obs_seq, reward_seq, env_params, filename=""):
+def plot_states(state_seq, obs_seq, reward_seq, env_params, filename="", viol_limits=None):
     import matplotlib.pyplot as plt
     import numpy as np
+
+    # thresholds for the constraint reference lines (see render_env)
+    _tilt_lim = (viol_limits or {}).get("tilt_deg", 20.0)
+    _thr_lim = (viol_limits or {}).get("thrust_frac", 0.9)
 
     # check if quat in state_seq, if true, then add a new item called rpy (roll, pitch, yaw)
     if "quat" in state_seq[0]:
@@ -475,6 +479,29 @@ def plot_states(state_seq, obs_seq, reward_seq, env_params, filename=""):
             )
             plt.ylabel(name)
             plt.legend()
+        elif name == "adapt_weights":
+            w = np.array([s[name] for s in state_seq])  # (T, n_terms)
+            current_fig += 1
+            plt.subplot(num_rows, plot_per_row, current_fig)
+            labels = ["w_pos", "w_vel", "w_yaw"]
+            for k in range(w.shape[1]):
+                lbl = labels[k] if k < len(labels) else f"w_{k}"
+                plt.plot(time, w[:, k], label=lbl)
+            plt.ylabel("adapt_weights")
+            plt.legend()
+        elif name in ("tilt_deg", "total_att_deg", "thrust_frac"):
+            vals = np.array([s[name] for s in state_seq])
+            current_fig += 1
+            plt.subplot(num_rows, plot_per_row, current_fig)
+            plt.plot(time, vals, label=name)
+            # reference limit lines
+            if name == "tilt_deg":
+                plt.axhline(_tilt_lim, color="r", ls="--", lw=0.8, label=f"{_tilt_lim:g}deg")
+            elif name == "thrust_frac":
+                plt.axhline(1.0, color="r", ls="--", lw=0.8, label="max")
+                plt.axhline(_thr_lim, color="orange", ls="--", lw=0.8, label=f"{_thr_lim:g}")
+            plt.ylabel(name)
+            plt.legend(fontsize=7)
         else:
             current_fig += 1
             plt.subplot(num_rows, plot_per_row, current_fig)

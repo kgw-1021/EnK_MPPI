@@ -563,7 +563,7 @@ def eval_env(
     run_one_ep_jit = jax.jit(run_one_ep)
     num_eps = int(total_steps // env.default_params.max_steps_in_episode)
     err_pos_ep = []
-    num_trajs = 1
+    num_trajs = 4
     rng, rng_reset_meta = jax.random.split(rng)
     rng_reset_list = jax.random.split(rng_reset_meta, num_trajs)
     for i, rng_reset in enumerate(rng_reset_list):
@@ -591,10 +591,20 @@ def eval_env(
         pickle.dump(np.array(err_pos_ep), f)
 
 
-def render_env(env: Quad3D, controller, control_params, repeat_times=1, filename=""):
+def render_env(env: Quad3D, controller, control_params, repeat_times=1, filename="",
+               viol_limits=None):
     """
-    Render the environment with a given controller
+    Render the environment with a given controller.
+
+    `viol_limits` sets the thresholds used ONLY for the violation summary and the
+    plot reference lines (the raw quantities are always recorded regardless):
+        {"tilt_deg": <deg>, "thrust_frac": <0..1>}
+    Defaults to {"tilt_deg": 20.0, "thrust_frac": 0.9}.
     """
+    if viol_limits is None:
+        viol_limits = {"tilt_deg": 40.0, "thrust_frac": 0.8}
+    tilt_lim = viol_limits.get("tilt_deg", 20.0)
+    thr_lim = viol_limits.get("thrust_frac", 0.9)
     # running environment
     rng = jax.random.PRNGKey(1)
     rng, rng_params = jax.random.split(rng)
@@ -602,6 +612,7 @@ def render_env(env: Quad3D, controller, control_params, repeat_times=1, filename
 
     state_seq, obs_seq, reward_seq = [], [], []
     control_seq = []
+    viol_seq = []  # per-step constraint-relevant physical quantities
     rng, rng_reset = jax.random.split(rng)
     obs, info, env_state = env.reset(rng_reset, env_params)
 
@@ -627,6 +638,20 @@ def render_env(env: Quad3D, controller, control_params, repeat_times=1, filename
             control_seq.append({"a_hat": control_params.a_hat})
         if hasattr(control_params, "quat_desired"):
             control_seq.append({"quat_desired": control_params.quat_desired})
+        # record adaptive cost-term weights (EKS adapt mode) for plotting
+        if getattr(controller, "adapt", False) and hasattr(control_params, "weights"):
+            control_seq.append({"adapt_weights": control_params.weights})
+        # record constraint-relevant physical quantities on the executed state/action
+        act_clip = jnp.clip(action, -1.0, 1.0)
+        qx, qy = env_state.quat[0], env_state.quat[1]
+        tilt_deg = jnp.degrees(jnp.arccos(jnp.clip(1.0 - 2.0 * (qx**2 + qy**2), -1.0, 1.0)))
+        total_att_deg = jnp.degrees(2.0 * jnp.arccos(jnp.clip(env_state.quat[3], -1.0, 1.0)))
+        thrust_frac = (act_clip[0] + 1.0) / 2.0  # thrust / max_thrust in [0, 1]
+        viol_seq.append({
+            "tilt_deg": float(tilt_deg),          # true tilt from vertical (roll/pitch)
+            "total_att_deg": float(total_att_deg),  # total attitude incl. yaw
+            "thrust_frac": float(thrust_frac),    # fraction of max_thrust
+        })
         next_obs, next_env_state, reward, done, info = env.step(
             rng_step, env_state, action, env_params
         )
@@ -645,6 +670,20 @@ def render_env(env: Quad3D, controller, control_params, repeat_times=1, filename
         env_state = next_env_state
     print(f"env running time: {time_module.time()-t0:.2f}s")
 
+    # constraint-violation summary (over the executed trajectory)
+    tilt_arr = np.array([v["tilt_deg"] for v in viol_seq])
+    tatt_arr = np.array([v["total_att_deg"] for v in viol_seq])
+    thr_arr = np.array([v["thrust_frac"] for v in viol_seq])
+    print("=" * 60)
+    print(f"Constraint / limit summary (executed trajectory)  "
+          f"[limits: tilt={tilt_lim}deg, thrust={thr_lim}]")
+    print(f"  tilt-from-vertical (deg): mean={tilt_arr.mean():.1f}  max={tilt_arr.max():.1f}"
+          f"  %>{tilt_lim:g}deg={100*np.mean(tilt_arr>tilt_lim):.1f}")
+    print(f"  total attitude    (deg): mean={tatt_arr.mean():.1f}  max={tatt_arr.max():.1f}")
+    print(f"  thrust / max_thrust     : mean={thr_arr.mean():.2f}  max={thr_arr.max():.2f}"
+          f"  %>{thr_lim:g}={100*np.mean(thr_arr>thr_lim):.1f}  %saturated(=1.0)={100*np.mean(thr_arr>0.999):.1f}")
+    print("=" * 60)
+
     # check if f"{quadjax.get_package_path()}/../results" folder exists, if not, create one
     save_path = f"{quadjax.get_package_path()}/../results"
     if not os.path.exists(save_path):
@@ -658,7 +697,11 @@ def render_env(env: Quad3D, controller, control_params, repeat_times=1, filename
         # merge control_seq into state_seq with dict
         for i in range(len(state_seq)):
             state_seq_dict[i] = {**state_seq_dict[i], **control_seq[i]}
-    utils.plot_states(state_seq_dict, obs_seq, reward_seq, env_params, filename)
+    # merge per-step constraint metrics for plotting / analysis
+    for i in range(len(state_seq)):
+        state_seq_dict[i] = {**state_seq_dict[i], **viol_seq[i]}
+    utils.plot_states(state_seq_dict, obs_seq, reward_seq, env_params, filename,
+                      viol_limits=viol_limits)
     print(f"plotting time: {time_module.time()-t0:.2f}s")
 
     file_path = f"{quadjax.get_package_path()}/../results/state_seq_{filename}.pkl"
@@ -752,8 +795,10 @@ def get_controller(env, controller_name, controller_params=None, debug=False):
         if debug:
             N, H = 4, 2
             print(f"[DEBUG], override controller parameters to be: N={N}, H={H}")
+        # covariance-driven adaptive cost weighting: eks_adapt (forces type mode)
+        adapt = "adapt" in controller_name
         # observation mode: eks_time (default) | eks_type | eks_both
-        if "type" in controller_name:
+        if adapt or "type" in controller_name:
             eks_mode = "type"
         elif "both" in controller_name:
             eks_mode = "both"
@@ -763,19 +808,37 @@ def get_controller(env, controller_name, controller_params=None, debug=False):
         sigmas = jnp.array([sigma] * env.action_dim)
         a_cov_per_step = jnp.diag(sigmas**2)
         a_cov = jnp.tile(a_cov_per_step, (H, 1, 1))
+        weights = utils.DEFAULT_PENYAW_WEIGHTS
+        # discount is a per-timestep observation weight. It only helps when the
+        # observation keeps a time axis (time/both): mild future-weighting aids
+        # corner anticipation. In time-collapsed modes (type/scalar) discount>1
+        # makes the collapsed cost far-future-dominated and HURTS -> use 1.0.
+        eks_discount = 1.1 if eks_mode in ("time", "both") else 1.0
         # same cost weights as the other methods (reproduces tracking_penyaw_reward_fn)
         control_params = controllers.EKSParams(
             gamma_mean=1.0,
             gamma_sigma=0.0,
-            discount=1.0,
+            discount=eks_discount,
             sample_sigma=sigma,
             a_mean=a_mean,
             a_cov=a_cov,
-            weights=utils.DEFAULT_PENYAW_WEIGHTS,
+            weights=weights,
+            S=jnp.zeros_like(weights),
         )
-        controller = controllers.EKSController(
-            env=env, control_params=control_params, N=N, H=H, lam=lam, mode=eks_mode
-        )
+        if adapt:
+            constraint_fns = [
+                controllers.eks.tilt_constraint(limit_deg=40.0),
+                controllers.eks.thrust_constraint(frac=0.8),
+            ]
+            controller = controllers.EKSController(
+                env=env, control_params=control_params, N=N, H=H, lam=lam,
+                mode=eks_mode, adapt=True, constraint_fns=constraint_fns,
+                blame_map="signed", eta=3.0,
+            )
+        else:
+            controller = controllers.EKSController(
+                env=env, control_params=control_params, N=N, H=H, lam=lam, mode=eks_mode
+            )
     else:
         raise NotImplementedError
     return controller, control_params
